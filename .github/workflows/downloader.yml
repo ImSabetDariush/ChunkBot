@@ -68,16 +68,11 @@ jobs:
           if [[ -n "$OUTPUT_NAME" ]]; then
             raw_name="$OUTPUT_NAME"
           else
-            raw_name="$(python3 - <<'PY'
-import os
-import urllib.parse
-
-url = os.environ["DOWNLOAD_URL"]
-path = urllib.parse.urlparse(url).path
-name = os.path.basename(urllib.parse.unquote(path)) or "download.bin"
-print(name)
-PY
-)"
+            url_without_query="${DOWNLOAD_URL%%\?*}"
+            raw_name="${url_without_query##*/}"
+            if [[ -z "$raw_name" || "$raw_name" == "$url_without_query" ]]; then
+              raw_name="download.bin"
+            fi
           fi
 
           safe_name="$(sanitize_component "$raw_name")"
@@ -105,19 +100,19 @@ PY
 
             split -b "$PART_BYTES" -d -a 4 "$tmp" "$folder/$safe_name.part-"
 
-            cat > "$folder/$safe_name.README.txt" <<EOF
-Original filename: $safe_name
-Original size: $size bytes
-SHA256: $hash
-
-This file was larger than 100MiB, so it was split into 98MiB parts.
-
-Rebuild command:
-cat $safe_name.part-* > $safe_name
-
-Verify command:
-sha256sum -c $safe_name.sha256
-EOF
+            {
+              echo "Original filename: $safe_name"
+              echo "Original size: $size bytes"
+              echo "SHA256: $hash"
+              echo ""
+              echo "This file was larger than 100MiB, so it was split into 98MiB parts."
+              echo ""
+              echo "Rebuild command:"
+              echo "cat $safe_name.part-* > $safe_name"
+              echo ""
+              echo "Verify command:"
+              echo "sha256sum -c $safe_name.sha256"
+            } > "$folder/$safe_name.README.txt"
 
             rm -f "$tmp"
           else
@@ -125,14 +120,14 @@ EOF
 
             mv "$tmp" "$folder/$safe_name"
 
-            cat > "$folder/$safe_name.README.txt" <<EOF
-Filename: $safe_name
-Size: $size bytes
-SHA256: $hash
-
-Verify command:
-sha256sum -c $safe_name.sha256
-EOF
+            {
+              echo "Filename: $safe_name"
+              echo "Size: $size bytes"
+              echo "SHA256: $hash"
+              echo ""
+              echo "Verify command:"
+              echo "sha256sum -c $safe_name.sha256"
+            } > "$folder/$safe_name.README.txt"
           fi
 
       - name: Commit and push changes
