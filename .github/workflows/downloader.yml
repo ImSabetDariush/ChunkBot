@@ -193,50 +193,50 @@ jobs:
             local headers="$1"
             local url="$2"
             python3 - "$headers" "$url" <<'PY'
-import os
-import sys
-import urllib.parse
-
-headers_path, url = sys.argv[1], sys.argv[2]
-
-content_dispositions = []
-try:
-    with open(headers_path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if line.lower().startswith("content-disposition:"):
-                content_dispositions.append(line.split(":", 1)[1].strip())
-except FileNotFoundError:
-    pass
-
-name = ""
-
-if content_dispositions:
-    cd = content_dispositions[-1]
-    params = {}
-    for part in cd.split(";")[1:]:
-        if "=" in part:
-            key, value = part.split("=", 1)
-            key = key.strip().lower()
-            value = value.strip().strip('"')
-            params[key] = value
-
-    if "filename*" in params:
-        value = params["filename*"]
-        if "''" in value:
-            value = value.split("''", 1)[1]
-        name = urllib.parse.unquote(value)
-    elif "filename" in params:
-        name = params["filename"]
-
-if not name:
-    path = urllib.parse.urlparse(url).path
-    name = os.path.basename(urllib.parse.unquote(path))
-
-if not name:
-    name = "download.bin"
-
-print(name)
-PY
+          import os
+          import sys
+          import urllib.parse
+          
+          headers_path, url = sys.argv[1], sys.argv[2]
+          
+          content_dispositions = []
+          try:
+              with open(headers_path, "r", encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      if line.lower().startswith("content-disposition:"):
+                          content_dispositions.append(line.split(":", 1)[1].strip())
+          except FileNotFoundError:
+              pass
+          
+          name = ""
+          
+          if content_dispositions:
+              cd = content_dispositions[-1]
+              params = {}
+              for part in cd.split(";")[1:]:
+                  if "=" in part:
+                      key, value = part.split("=", 1)
+                      key = key.strip().lower()
+                      value = value.strip().strip('"')
+                      params[key] = value
+          
+              if "filename*" in params:
+                  value = params["filename*"]
+                  if "''" in value:
+                      value = value.split("''", 1)[1]
+                  name = urllib.parse.unquote(value)
+              elif "filename" in params:
+                  name = params["filename"]
+          
+          if not name:
+              path = urllib.parse.urlparse(url).path
+              name = os.path.basename(urllib.parse.unquote(path))
+          
+          if not name:
+              name = "download.bin"
+          
+          print(name)
+          PY
           }
 
           create_release_if_needed() {
@@ -474,34 +474,34 @@ PY
             export CB_SPLIT_SIZE_MIB="$SPLIT_SIZE_MIB"
             export CB_REPO_PUSH_BATCH_MIB="$REPO_PUSH_BATCH_MIB"
             python3 - <<'PY'
-import json
-import os
-from datetime import datetime, timezone
-
-target_dir = os.environ["CB_TARGET_DIR"]
-asset_prefix = os.environ["CB_ASSET_PREFIX"]
-planned_files = sorted(set(os.listdir(target_dir) + ["manifest.json"]))
-
-manifest = {
-    "created_at_utc": datetime.now(timezone.utc).isoformat(),
-    "url": os.environ["CB_URL"],
-    "filename": os.environ["CB_FILENAME"],
-    "size_bytes": int(os.environ["CB_SIZE"]),
-    "sha256": os.environ["CB_SHA256"],
-    "split": os.environ["CB_SPLIT"].lower() == "true",
-    "part_count": int(os.environ["CB_PART_COUNT"]),
-    "split_size_mib": int(os.environ["CB_SPLIT_SIZE_MIB"]),
-    "repo_push_batch_mib": int(os.environ["CB_REPO_PUSH_BATCH_MIB"]),
-    "storage_mode": os.environ["CB_STORAGE_MODE"],
-    "subdir": os.environ["CB_SUBDIR"],
-    "asset_prefix": asset_prefix,
-    "files": planned_files,
-    "release_asset_names": [asset_prefix + f for f in planned_files] if asset_prefix else [],
-}
-with open(os.path.join(target_dir, "manifest.json"), "w", encoding="utf-8") as f:
-    json.dump(manifest, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-PY
+          import json
+          import os
+          from datetime import datetime, timezone
+          
+          target_dir = os.environ["CB_TARGET_DIR"]
+          asset_prefix = os.environ["CB_ASSET_PREFIX"]
+          planned_files = sorted(set(os.listdir(target_dir) + ["manifest.json"]))
+          
+          manifest = {
+              "created_at_utc": datetime.now(timezone.utc).isoformat(),
+              "url": os.environ["CB_URL"],
+              "filename": os.environ["CB_FILENAME"],
+              "size_bytes": int(os.environ["CB_SIZE"]),
+              "sha256": os.environ["CB_SHA256"],
+              "split": os.environ["CB_SPLIT"].lower() == "true",
+              "part_count": int(os.environ["CB_PART_COUNT"]),
+              "split_size_mib": int(os.environ["CB_SPLIT_SIZE_MIB"]),
+              "repo_push_batch_mib": int(os.environ["CB_REPO_PUSH_BATCH_MIB"]),
+              "storage_mode": os.environ["CB_STORAGE_MODE"],
+              "subdir": os.environ["CB_SUBDIR"],
+              "asset_prefix": asset_prefix,
+              "files": planned_files,
+              "release_asset_names": [asset_prefix + f for f in planned_files] if asset_prefix else [],
+          }
+          with open(os.path.join(target_dir, "manifest.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+              f.write("\n")
+          PY
 
             if [[ "$effective_storage_mode" == "release" ]]; then
               while IFS= read -r -d '' f; do
