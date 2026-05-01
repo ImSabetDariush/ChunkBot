@@ -1,0 +1,152 @@
+name: Simple Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct download URL"
+        required: true
+        type: string
+      output_folder:
+        description: "Folder inside repo"
+        required: false
+        default: "downloads"
+        type: string
+      output_name:
+        description: "Optional output file name"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: simple-downloader
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Download file and split if larger than 100MiB
+        shell: bash
+        env:
+          DOWNLOAD_URL: ${{ inputs.url }}
+          OUTPUT_FOLDER: ${{ inputs.output_folder }}
+          OUTPUT_NAME: ${{ inputs.output_name }}
+        run: |
+          set -euo pipefail
+
+          LIMIT_BYTES=$((100 * 1024 * 1024))
+          PART_BYTES=$((98 * 1024 * 1024))
+
+          sanitize_component() {
+            printf '%s' "$1" | tr -cd 'A-Za-z0-9._-'
+          }
+
+          folder="$(printf '%s' "$OUTPUT_FOLDER" | sed 's#^\./##; s#//*#/#g; s#/$##')"
+
+          if [[ -z "$folder" || "$folder" == "." || "$folder" == /* || "$folder" == *".."* ]]; then
+            echo "Invalid output folder: $folder"
+            exit 1
+          fi
+
+          mkdir -p "$folder"
+
+          if [[ -n "$OUTPUT_NAME" ]]; then
+            raw_name="$OUTPUT_NAME"
+          else
+            raw_name="$(python3 - <<'PY'
+import os
+import urllib.parse
+
+url = os.environ["DOWNLOAD_URL"]
+path = urllib.parse.urlparse(url).path
+name = os.path.basename(urllib.parse.unquote(path)) or "download.bin"
+print(name)
+PY
+)"
+          fi
+
+          safe_name="$(sanitize_component "$raw_name")"
+
+          if [[ -z "$safe_name" || "$safe_name" == "." || "$safe_name" == ".." ]]; then
+            safe_name="download.bin"
+          fi
+
+          tmp="$(mktemp)"
+
+          echo "Downloading..."
+          curl --fail --location --retry 3 --connect-timeout 30 --output "$tmp" "$DOWNLOAD_URL"
+
+          size="$(stat -c%s "$tmp")"
+          echo "Downloaded size: $size bytes"
+
+          hash="$(sha256sum "$tmp" | awk '{print $1}')"
+
+          rm -f "$folder/$safe_name" "$folder/$safe_name".part-* "$folder/$safe_name.sha256" "$folder/$safe_name.README.txt"
+
+          printf "%s  %s\n" "$hash" "$safe_name" > "$folder/$safe_name.sha256"
+
+          if (( size > LIMIT_BYTES )); then
+            echo "File is larger than 100MiB. Splitting into 98MiB parts..."
+
+            split -b "$PART_BYTES" -d -a 4 "$tmp" "$folder/$safe_name.part-"
+
+            cat > "$folder/$safe_name.README.txt" <<EOF
+Original filename: $safe_name
+Original size: $size bytes
+SHA256: $hash
+
+This file was larger than 100MiB, so it was split into 98MiB parts.
+
+Rebuild command:
+cat $safe_name.part-* > $safe_name
+
+Verify command:
+sha256sum -c $safe_name.sha256
+EOF
+
+            rm -f "$tmp"
+          else
+            echo "File is 100MiB or smaller. Saving as a single file..."
+
+            mv "$tmp" "$folder/$safe_name"
+
+            cat > "$folder/$safe_name.README.txt" <<EOF
+Filename: $safe_name
+Size: $size bytes
+SHA256: $hash
+
+Verify command:
+sha256sum -c $safe_name.sha256
+EOF
+          fi
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Add downloaded file"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
