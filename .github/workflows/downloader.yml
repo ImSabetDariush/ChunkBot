@@ -37,9 +37,9 @@ on:
         default: "98"
         type: string
       repo_push_batch_mib:
-        description: "Max staged file size per repo push batch in MiB. Keep below GitHub's 2GiB push limit."
+        description: "Max staged file size per repo push batch in MiB. Smaller values are safer for large repo uploads."
         required: false
-        default: "1500"
+        default: "500"
         type: string
       auto_release_above_mib:
         description: "When storage_mode=auto, files larger than this MiB are saved to release."
@@ -114,8 +114,8 @@ jobs:
             exit 1
           fi
 
-          if (( REPO_PUSH_BATCH_MIB < 100 || REPO_PUSH_BATCH_MIB > 1900 )); then
-            echo "repo_push_batch_mib must be between 100 and 1900."
+          if (( REPO_PUSH_BATCH_MIB < 100 || REPO_PUSH_BATCH_MIB > 900 )); then
+            echo "repo_push_batch_mib must be between 100 and 900."
             exit 1
           fi
 
@@ -262,7 +262,7 @@ jobs:
             git commit -m "Add downloaded files via ChunkBox batch $batch_num"
             git fetch origin "$GITHUB_REF_NAME"
             git rebase "origin/$GITHUB_REF_NAME"
-            git push origin "HEAD:$GITHUB_REF_NAME"
+            git push --progress origin "HEAD:$GITHUB_REF_NAME"
           }
 
           commit_and_push_repo_changes_in_batches() {
@@ -291,7 +291,7 @@ jobs:
               file_size="$(stat -c%s "$file")"
 
               if (( current_bytes > 0 && current_bytes + file_size > REPO_PUSH_BATCH_BYTES )); then
-                echo "Pushing batch $batch_num..."
+                echo "Pushing batch $batch_num with git progress output..."
                 commit_staged_batch "$batch_num"
                 batch_num=$((batch_num + 1))
                 current_bytes=0
@@ -303,7 +303,7 @@ jobs:
             done
 
             if (( has_files == 1 )); then
-              echo "Pushing final batch $batch_num..."
+              echo "Pushing final batch $batch_num with git progress output..."
               commit_staged_batch "$batch_num"
               echo "" >> "$summary_file"
               echo "Committed and pushed repository files in batches." >> "$summary_file"
