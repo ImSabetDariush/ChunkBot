@@ -1,4 +1,4 @@
-name: PartFetch Downloader v2
+name: ChunkBox Downloader
 
 on:
   workflow_dispatch:
@@ -8,13 +8,14 @@ on:
         required: true
         type: string
       storage_mode:
-        description: "Where to save the result"
+        description: "Where to save results. repo uses batched pushes, release uploads assets, auto chooses release for big files."
         required: true
         default: "repo"
         type: choice
         options:
           - repo
           - release
+          - auto
       output_folder:
         description: "Folder inside repo when storage_mode=repo"
         required: false
@@ -26,7 +27,7 @@ on:
         default: ""
         type: string
       release_tag:
-        description: "Release tag when storage_mode=release. Empty means auto-generated."
+        description: "Release tag when storage_mode=release or auto chooses release. Empty means auto-generated."
         required: false
         default: ""
         type: string
@@ -34,6 +35,16 @@ on:
         description: "Part size in MiB. Must be 1-98."
         required: false
         default: "98"
+        type: string
+      repo_push_batch_mib:
+        description: "Max staged file size per repo push batch in MiB. Keep below GitHub's 2GiB push limit."
+        required: false
+        default: "1500"
+        type: string
+      auto_release_above_mib:
+        description: "When storage_mode=auto, files larger than this MiB are saved to release."
+        required: false
+        default: "1800"
         type: string
       dedupe:
         description: "Skip repo save if a manifest with the same SHA256 already exists"
@@ -45,12 +56,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: partfetch-downloader
+  group: chunkbox-downloader
   cancel-in-progress: false
 
 jobs:
   download:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     env:
       URLS: ${{ inputs.urls }}
@@ -59,6 +71,8 @@ jobs:
       OUTPUT_NAME: ${{ inputs.output_name }}
       RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
       SPLIT_SIZE_MIB: ${{ inputs.split_size_mib }}
+      REPO_PUSH_BATCH_MIB: ${{ inputs.repo_push_batch_mib }}
+      AUTO_RELEASE_ABOVE_MIB: ${{ inputs.auto_release_above_mib }}
       DEDUPE: ${{ inputs.dedupe }}
       GH_TOKEN: ${{ github.token }}
       HTTP_AUTH_HEADER: ${{ secrets.DOWNLOAD_AUTH_HEADER }}
@@ -82,22 +96,37 @@ jobs:
 
           LIMIT_BYTES=$((100 * 1024 * 1024))
 
-          if ! [[ "$SPLIT_SIZE_MIB" =~ ^[0-9]+$ ]]; then
-            echo "split_size_mib must be a number."
-            exit 1
-          fi
+          require_number() {
+            local value="$1"
+            local name="$2"
+            if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+              echo "$name must be a number."
+              exit 1
+            fi
+          }
+
+          require_number "$SPLIT_SIZE_MIB" "split_size_mib"
+          require_number "$REPO_PUSH_BATCH_MIB" "repo_push_batch_mib"
+          require_number "$AUTO_RELEASE_ABOVE_MIB" "auto_release_above_mib"
 
           if (( SPLIT_SIZE_MIB < 1 || SPLIT_SIZE_MIB > 98 )); then
             echo "split_size_mib must be between 1 and 98."
             exit 1
           fi
 
-          PART_BYTES=$((SPLIT_SIZE_MIB * 1024 * 1024))
-
-          if [[ "$STORAGE_MODE" != "repo" && "$STORAGE_MODE" != "release" ]]; then
-            echo "storage_mode must be repo or release."
+          if (( REPO_PUSH_BATCH_MIB < 100 || REPO_PUSH_BATCH_MIB > 1900 )); then
+            echo "repo_push_batch_mib must be between 100 and 1900."
             exit 1
           fi
+
+          if [[ "$STORAGE_MODE" != "repo" && "$STORAGE_MODE" != "release" && "$STORAGE_MODE" != "auto" ]]; then
+            echo "storage_mode must be repo, release, or auto."
+            exit 1
+          fi
+
+          PART_BYTES=$((SPLIT_SIZE_MIB * 1024 * 1024))
+          REPO_PUSH_BATCH_BYTES=$((REPO_PUSH_BATCH_MIB * 1024 * 1024))
+          AUTO_RELEASE_ABOVE_BYTES=$((AUTO_RELEASE_ABOVE_MIB * 1024 * 1024))
 
           sanitize_component() {
             printf '%s' "$1" | tr -cd 'A-Za-z0-9._-'
@@ -114,7 +143,7 @@ jobs:
             exit 1
           fi
 
-          urls_file="$RUNNER_TEMP/partfetch-urls.txt"
+          urls_file="$RUNNER_TEMP/chunkbox-urls.txt"
           printf '%s\n' "$URLS" \
             | tr ',' '\n' \
             | sed 's/\r//g' \
@@ -130,22 +159,23 @@ jobs:
           fi
 
           timestamp="$(date -u +'%Y-%m-%d_%H%M%S')"
-          work_dir="$RUNNER_TEMP/partfetch-work"
-          release_asset_dir="$RUNNER_TEMP/partfetch-release-assets"
-          summary_file="$RUNNER_TEMP/partfetch-summary.md"
+          work_dir="$RUNNER_TEMP/chunkbox-work"
+          release_asset_dir="$RUNNER_TEMP/chunkbox-release-assets"
+          summary_file="$RUNNER_TEMP/chunkbox-summary.md"
 
           rm -rf "$work_dir" "$release_asset_dir"
           mkdir -p "$work_dir" "$release_asset_dir"
 
           {
-            echo "# PartFetch v2 Summary"
+            echo "# ChunkBox Summary"
             echo ""
-            echo "- Storage mode: \`$STORAGE_MODE\`"
+            echo "- Requested storage mode: \`$STORAGE_MODE\`"
             echo "- URL count: \`$url_count\`"
             echo "- Split size: \`${SPLIT_SIZE_MIB}MiB\`"
+            echo "- Repo push batch: \`${REPO_PUSH_BATCH_MIB}MiB\`"
             echo ""
-            echo "| # | File | Size | Parts | SHA256 | Location |"
-            echo "|---:|---|---:|---:|---|---|"
+            echo "| # | File | Size | Parts | SHA256 | Storage | Location |"
+            echo "|---:|---|---:|---:|---|---|---|"
           } > "$summary_file"
 
           build_auth_args() {
@@ -163,53 +193,126 @@ jobs:
             local headers="$1"
             local url="$2"
             python3 - "$headers" "$url" <<'PY'
-          import os
-          import sys
-          import urllib.parse
+import os
+import sys
+import urllib.parse
 
-          headers_path, url = sys.argv[1], sys.argv[2]
+headers_path, url = sys.argv[1], sys.argv[2]
 
-          content_dispositions = []
-          try:
-              with open(headers_path, "r", encoding="utf-8", errors="replace") as f:
-                  for line in f:
-                      if line.lower().startswith("content-disposition:"):
-                          content_dispositions.append(line.split(":", 1)[1].strip())
-          except FileNotFoundError:
-              pass
+content_dispositions = []
+try:
+    with open(headers_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.lower().startswith("content-disposition:"):
+                content_dispositions.append(line.split(":", 1)[1].strip())
+except FileNotFoundError:
+    pass
 
-          name = ""
+name = ""
 
-          if content_dispositions:
-              cd = content_dispositions[-1]
-              params = {}
-              for part in cd.split(";")[1:]:
-                  if "=" in part:
-                      key, value = part.split("=", 1)
-                      key = key.strip().lower()
-                      value = value.strip().strip('"')
-                      params[key] = value
+if content_dispositions:
+    cd = content_dispositions[-1]
+    params = {}
+    for part in cd.split(";")[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip().strip('"')
+            params[key] = value
 
-              if "filename*" in params:
-                  value = params["filename*"]
-                  if "''" in value:
-                      value = value.split("''", 1)[1]
-                  name = urllib.parse.unquote(value)
-              elif "filename" in params:
-                  name = params["filename"]
+    if "filename*" in params:
+        value = params["filename*"]
+        if "''" in value:
+            value = value.split("''", 1)[1]
+        name = urllib.parse.unquote(value)
+    elif "filename" in params:
+        name = params["filename"]
 
-          if not name:
-              path = urllib.parse.urlparse(url).path
-              name = os.path.basename(urllib.parse.unquote(path))
+if not name:
+    path = urllib.parse.urlparse(url).path
+    name = os.path.basename(urllib.parse.unquote(path))
 
-          if not name:
-              name = "download.bin"
+if not name:
+    name = "download.bin"
 
-          print(name)
-          PY
+print(name)
+PY
+          }
+
+          create_release_if_needed() {
+            local release_tag="$1"
+            local notes_file="$2"
+
+            if gh release view "$release_tag" >/dev/null 2>&1; then
+              echo "Release exists: $release_tag"
+            else
+              gh release create "$release_tag" \
+                --title "ChunkBox download $GITHUB_RUN_NUMBER" \
+                --notes-file "$notes_file"
+            fi
+          }
+
+          commit_staged_batch() {
+            local batch_num="$1"
+
+            if git diff --cached --quiet; then
+              return 0
+            fi
+
+            git commit -m "Add downloaded files via ChunkBox batch $batch_num"
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          }
+
+          commit_and_push_repo_changes_in_batches() {
+            local target_path="$1"
+            local batch_num=1
+            local current_bytes=0
+            local file_size=0
+            local has_files=0
+
+            mapfile -d '' repo_files < <(git ls-files -o -m --exclude-standard -z -- "$target_path" | sort -z)
+
+            if (( ${#repo_files[@]} == 0 )); then
+              echo "No repository changes to commit."
+              echo "" >> "$summary_file"
+              echo "No repository changes to commit." >> "$summary_file"
+              return 0
+            fi
+
+            echo "Committing and pushing repo files in batches up to ${REPO_PUSH_BATCH_MIB}MiB..."
+
+            for file in "${repo_files[@]}"; do
+              if [[ ! -f "$file" ]]; then
+                continue
+              fi
+
+              file_size="$(stat -c%s "$file")"
+
+              if (( current_bytes > 0 && current_bytes + file_size > REPO_PUSH_BATCH_BYTES )); then
+                echo "Pushing batch $batch_num..."
+                commit_staged_batch "$batch_num"
+                batch_num=$((batch_num + 1))
+                current_bytes=0
+              fi
+
+              git add -- "$file"
+              current_bytes=$((current_bytes + file_size))
+              has_files=1
+            done
+
+            if (( has_files == 1 )); then
+              echo "Pushing final batch $batch_num..."
+              commit_staged_batch "$batch_num"
+              echo "" >> "$summary_file"
+              echo "Committed and pushed repository files in batches." >> "$summary_file"
+            fi
           }
 
           index=0
+          repo_files_created=0
+          release_files_created=0
 
           while IFS= read -r url; do
             index=$((index + 1))
@@ -243,6 +346,15 @@ jobs:
             hash="$(sha256sum "$tmp_file" | awk '{print $1}')"
             short_hash="${hash:0:12}"
 
+            effective_storage_mode="$STORAGE_MODE"
+            if [[ "$STORAGE_MODE" == "auto" ]]; then
+              if (( size > AUTO_RELEASE_ABOVE_BYTES )); then
+                effective_storage_mode="release"
+              else
+                effective_storage_mode="repo"
+              fi
+            fi
+
             base_name="${safe_name%.*}"
             if [[ -z "$base_name" || "$base_name" == "$safe_name" && "$safe_name" == .* ]]; then
               base_name="file"
@@ -255,21 +367,25 @@ jobs:
 
             subdir="${timestamp}_${index_pad}_${base_name}_${short_hash}"
 
-            if [[ "$STORAGE_MODE" == "repo" && "$DEDUPE" == "true" && -d "$folder" ]]; then
+            if [[ "$effective_storage_mode" == "repo" && "$DEDUPE" == "true" && -d "$folder" ]]; then
               if grep -R -l "\"sha256\": \"$hash\"" "$folder" >/dev/null 2>&1; then
                 echo "Duplicate SHA256 found in repo manifests. Skipping: $safe_name"
                 {
-                  echo "| $index | \`$safe_name\` | $size | 0 | \`${short_hash}...\` | skipped duplicate |"
+                  echo "| $index | \`$safe_name\` | $size | 0 | \`${short_hash}...\` | repo | skipped duplicate |"
                 } >> "$summary_file"
                 rm -f "$tmp_file" "$headers_file"
                 continue
               fi
             fi
 
-            if [[ "$STORAGE_MODE" == "repo" ]]; then
+            if [[ "$effective_storage_mode" == "repo" ]]; then
               target_dir="$folder/$subdir"
+              asset_prefix=""
+              repo_files_created=1
             else
               target_dir="$work_dir/$subdir"
+              asset_prefix="${subdir}__"
+              release_files_created=1
             fi
 
             mkdir -p "$target_dir"
@@ -290,30 +406,24 @@ jobs:
               mv "$tmp_file" "$target_dir/$safe_name"
             fi
 
-            if [[ "$STORAGE_MODE" == "release" ]]; then
-              asset_prefix="${subdir}__"
-              rebuild_input_prefix="${asset_prefix}"
-            else
-              asset_prefix=""
-              rebuild_input_prefix=""
-            fi
-
             if [[ "$split_status" == "true" ]]; then
               {
                 echo "#!/usr/bin/env bash"
                 echo "set -euo pipefail"
-                echo "cat \"${rebuild_input_prefix}${safe_name}.part-\"* > \"$safe_name\""
-                echo "sha256sum -c \"${rebuild_input_prefix}${sha_file}\""
+                echo 'cd "$(dirname "$0")"'
+                echo "cat \"${asset_prefix}${safe_name}.part-\"* > \"$safe_name\""
+                echo "sha256sum -c \"${asset_prefix}${sha_file}\""
               } > "$target_dir/rebuild.sh"
               chmod +x "$target_dir/rebuild.sh"
             else
               {
                 echo "#!/usr/bin/env bash"
                 echo "set -euo pipefail"
-                if [[ "$STORAGE_MODE" == "release" ]]; then
-                  echo "cp \"${rebuild_input_prefix}${safe_name}\" \"$safe_name\""
+                echo 'cd "$(dirname "$0")"'
+                if [[ "$effective_storage_mode" == "release" ]]; then
+                  echo "cp \"${asset_prefix}${safe_name}\" \"$safe_name\""
                 fi
-                echo "sha256sum -c \"${rebuild_input_prefix}${sha_file}\""
+                echo "sha256sum -c \"${asset_prefix}${sha_file}\""
               } > "$target_dir/verify.sh"
               chmod +x "$target_dir/verify.sh"
             fi
@@ -326,13 +436,13 @@ jobs:
               echo "- SHA256: \`$hash\`"
               echo "- Split: \`$split_status\`"
               echo "- Parts: \`$part_count\`"
-              echo "- Storage mode: \`$STORAGE_MODE\`"
+              echo "- Storage mode: \`$effective_storage_mode\`"
               echo ""
               if [[ "$split_status" == "true" ]]; then
                 echo "## Rebuild"
                 echo ""
                 echo "\`\`\`bash"
-                if [[ "$STORAGE_MODE" == "release" ]]; then
+                if [[ "$effective_storage_mode" == "release" ]]; then
                   echo "bash ${asset_prefix}rebuild.sh"
                 else
                   echo "bash rebuild.sh"
@@ -342,7 +452,7 @@ jobs:
                 echo "## Verify"
                 echo ""
                 echo "\`\`\`bash"
-                if [[ "$STORAGE_MODE" == "release" ]]; then
+                if [[ "$effective_storage_mode" == "release" ]]; then
                   echo "bash ${asset_prefix}verify.sh"
                 else
                   echo "bash verify.sh"
@@ -351,47 +461,49 @@ jobs:
               fi
             } > "$target_dir/README.md"
 
-            export PF_TARGET_DIR="$target_dir"
-            export PF_URL="$url"
-            export PF_FILENAME="$safe_name"
-            export PF_SIZE="$size"
-            export PF_SHA256="$hash"
-            export PF_SPLIT="$split_status"
-            export PF_PART_COUNT="$part_count"
-            export PF_STORAGE_MODE="$STORAGE_MODE"
-            export PF_SUBDIR="$subdir"
-            export PF_ASSET_PREFIX="$asset_prefix"
-            export PF_SPLIT_SIZE_MIB="$SPLIT_SIZE_MIB"
+            export CB_TARGET_DIR="$target_dir"
+            export CB_URL="$url"
+            export CB_FILENAME="$safe_name"
+            export CB_SIZE="$size"
+            export CB_SHA256="$hash"
+            export CB_SPLIT="$split_status"
+            export CB_PART_COUNT="$part_count"
+            export CB_STORAGE_MODE="$effective_storage_mode"
+            export CB_SUBDIR="$subdir"
+            export CB_ASSET_PREFIX="$asset_prefix"
+            export CB_SPLIT_SIZE_MIB="$SPLIT_SIZE_MIB"
+            export CB_REPO_PUSH_BATCH_MIB="$REPO_PUSH_BATCH_MIB"
             python3 - <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
+import json
+import os
+from datetime import datetime, timezone
 
-          target_dir = os.environ["PF_TARGET_DIR"]
-          asset_prefix = os.environ["PF_ASSET_PREFIX"]
-          planned_files = sorted(set(os.listdir(target_dir) + ["manifest.json"]))
+target_dir = os.environ["CB_TARGET_DIR"]
+asset_prefix = os.environ["CB_ASSET_PREFIX"]
+planned_files = sorted(set(os.listdir(target_dir) + ["manifest.json"]))
 
-          manifest = {
-              "created_at_utc": datetime.now(timezone.utc).isoformat(),
-              "url": os.environ["PF_URL"],
-              "filename": os.environ["PF_FILENAME"],
-              "size_bytes": int(os.environ["PF_SIZE"]),
-              "sha256": os.environ["PF_SHA256"],
-              "split": os.environ["PF_SPLIT"].lower() == "true",
-              "part_count": int(os.environ["PF_PART_COUNT"]),
-              "split_size_mib": int(os.environ["PF_SPLIT_SIZE_MIB"]),
-              "storage_mode": os.environ["PF_STORAGE_MODE"],
-              "subdir": os.environ["PF_SUBDIR"],
-              "asset_prefix": asset_prefix,
-              "files": planned_files,
-              "release_asset_names": [asset_prefix + f for f in planned_files] if asset_prefix else [],
-          }
-          with open(os.path.join(target_dir, "manifest.json"), "w", encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False, indent=2)
-              f.write("\n")
-          PY
+manifest = {
+    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+    "url": os.environ["CB_URL"],
+    "filename": os.environ["CB_FILENAME"],
+    "size_bytes": int(os.environ["CB_SIZE"]),
+    "sha256": os.environ["CB_SHA256"],
+    "split": os.environ["CB_SPLIT"].lower() == "true",
+    "part_count": int(os.environ["CB_PART_COUNT"]),
+    "split_size_mib": int(os.environ["CB_SPLIT_SIZE_MIB"]),
+    "repo_push_batch_mib": int(os.environ["CB_REPO_PUSH_BATCH_MIB"]),
+    "storage_mode": os.environ["CB_STORAGE_MODE"],
+    "subdir": os.environ["CB_SUBDIR"],
+    "asset_prefix": asset_prefix,
+    "files": planned_files,
+    "release_asset_names": [asset_prefix + f for f in planned_files] if asset_prefix else [],
+}
+with open(os.path.join(target_dir, "manifest.json"), "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PY
 
-            if [[ "$STORAGE_MODE" == "release" ]]; then
+            if [[ "$effective_storage_mode" == "release" ]]; then
               while IFS= read -r -d '' f; do
                 cp "$f" "$release_asset_dir/${asset_prefix}$(basename "$f")"
               done < <(find "$target_dir" -maxdepth 1 -type f -print0)
@@ -401,42 +513,26 @@ jobs:
             fi
 
             {
-              echo "| $index | \`$safe_name\` | $size | $part_count | \`${short_hash}...\` | \`$location\` |"
+              echo "| $index | \`$safe_name\` | $size | $part_count | \`${short_hash}...\` | $effective_storage_mode | \`$location\` |"
             } >> "$summary_file"
 
             rm -f "$headers_file"
           done < "$urls_file"
 
-          if [[ "$STORAGE_MODE" == "repo" ]]; then
-            git add "$folder"
+          if (( repo_files_created == 1 )); then
+            commit_and_push_repo_changes_in_batches "$folder"
+          fi
 
-            if git diff --cached --quiet; then
-              echo "No repository changes to commit."
-              echo "" >> "$summary_file"
-              echo "No repository changes to commit." >> "$summary_file"
-            else
-              git commit -m "Add downloaded files via PartFetch"
-              git pull --rebase origin "$GITHUB_REF_NAME"
-              git push origin "HEAD:$GITHUB_REF_NAME"
-              echo "" >> "$summary_file"
-              echo "Committed and pushed downloaded files to \`$GITHUB_REF_NAME\`." >> "$summary_file"
-            fi
-          else
+          if (( release_files_created == 1 )); then
             release_tag="$RELEASE_TAG_INPUT"
             if [[ -z "$release_tag" ]]; then
-              release_tag="partfetch-${GITHUB_RUN_NUMBER}"
+              release_tag="chunkbox-${GITHUB_RUN_NUMBER}"
             fi
 
-            release_notes="$RUNNER_TEMP/partfetch-release-notes.md"
+            release_notes="$RUNNER_TEMP/chunkbox-release-notes.md"
             cp "$summary_file" "$release_notes"
 
-            if gh release view "$release_tag" >/dev/null 2>&1; then
-              echo "Release exists: $release_tag"
-            else
-              gh release create "$release_tag" \
-                --title "PartFetch download $GITHUB_RUN_NUMBER" \
-                --notes-file "$release_notes"
-            fi
+            create_release_if_needed "$release_tag" "$release_notes"
 
             mapfile -t upload_files < <(find "$release_asset_dir" -type f | sort)
 
