@@ -1,0 +1,22 @@
+{
+  "created_at_utc": "2026-05-01T23:42:20.980640+00:00",
+  "url": "https://packages.microsoft.com/yumrepos/vscode/repodata/repomd.xml",
+  "filename": "repomd.xml",
+  "size_bytes": 1568,
+  "sha256": "2eddbf2e01401cba024d04d60178321f8be761bcb8a763db0e7e384759429737",
+  "split": false,
+  "part_count": 1,
+  "split_size_mib": 98,
+  "repo_push_batch_mib": 500,
+  "storage_mode": "repo",
+  "subdir": "2026-05-01_234220_001_repomd_2eddbf2e0140",
+  "asset_prefix": "",
+  "files": [
+    "README.md",
+    "manifest.json",
+    "repomd.xml",
+    "repomd.xml.sha256",
+    "verify.sh"
+  ],
+  "release_asset_names": []
+}
